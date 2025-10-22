@@ -37,19 +37,15 @@ impl Scale {
     pub fn len(&self) -> usize {
         self.notes.len()
     }
-
-    #[cfg(test)]
-    pub fn from_notes(notes: &[ENote]) -> Self {
-        Scale { notes: notes.to_vec() }
-    }
 }
 
 pub fn init_scale(root: ENote, scale: EScale) -> Scale {
     let intervals = get_scale_intervals(scale);
-    let mut notes = Vec::with_capacity(intervals.len());
+    let notes: Vec<ENote> = 
+        intervals
+            .iter()
+            .map(|interval| root + *interval)
+            .collect();
 
-    for interval in intervals {
-        notes.push(root + interval);
-    }
     Scale { notes }
 }
