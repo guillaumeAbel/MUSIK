@@ -1,0 +1,15 @@
+[package]
+name = "simple_sine"
+version = "0.1.0"
+edition = "2021"
+authors = ["GA"]
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+
+[workspace]
+members = ["xtask"]
