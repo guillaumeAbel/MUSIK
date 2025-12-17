@@ -12,6 +12,7 @@ struct SimpleSine {
     freq_hz: f32,
     note_on: bool,
     sample_rate: f32,
+    last_output: f32,
 }
 
 impl Default for SineParams {
@@ -28,6 +29,7 @@ impl Default for SimpleSine {
             freq_hz: 440.0,
             note_on: false,
             sample_rate: 44100.0,
+            last_output: 0.0,
         }
     }
 }
@@ -35,6 +37,17 @@ impl Default for SimpleSine {
 fn midi_note_to_freq(note: u8) -> f32 {
     let n = note as f32;
     440.0 * 2f32.powf((n - 69.0) / 12.0)
+}
+
+fn poly_blep(mut t: f32, delta: f32) -> f32 {
+    if t < delta {
+        t /= delta;
+        return t + t - t * t - 1.0;
+    } else if t > 1.0 - delta {
+        t = (t - 1.0) / delta;
+        return t * t + t + t + 1.0;
+    }
+    0.0
 }
 
 impl Plugin for SimpleSine {
@@ -80,6 +93,7 @@ impl Plugin for SimpleSine {
 
     fn reset(&mut self) {
         self.phase = 0.0;
+        self.last_output = 0.0;
         self.note_on = false;
     }
 
@@ -106,23 +120,34 @@ impl Plugin for SimpleSine {
             }
         }
 
-        let sr = self.sample_rate.max(1.0);
-        let freq = self.freq_hz;
+        let delta = self.freq_hz / self.sample_rate.max(1.0); 
+        let level: f32 = 0.3;
 
         for mut channel_samples in buffer.iter_samples() {
-            let sample_value: f32;
+            let mut value: f32;
             if self.note_on {
-                sample_value = (2.0 * std::f32::consts::PI * self.phase).sin();
+                if self.phase < 0.5 {
+                    value = 1.0;
+                } else {
+                    value = -1.0;
+                }
+                value += poly_blep(self.phase, delta);
+                let t = (self.phase + 0.5) % 1.0;
+                value -= poly_blep(t, delta);
+                //from square to triangle
+                value = delta * value + (1.0 - delta) * self.last_output;
+                self.last_output = value;
+                value *= level;
 
-                self.phase += freq / sr;
+                self.phase += delta;
                 if self.phase >= 1.0 {
-                    self.phase = 0.0;
+                    self.phase -= 1.0;
                 }
             } else {
-                sample_value = 0.0;
-            };
+                value = 0.0;
+            }
             for sample in channel_samples.iter_mut() {
-                *sample = sample_value;
+                *sample = value;
             }
         }
 
