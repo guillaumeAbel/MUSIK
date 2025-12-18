@@ -1,9 +1,16 @@
 use nih_plug::prelude::*;
+use nih_plug_egui::{create_egui_editor, EguiState};
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use ringbuf::{traits::*, HeapRb, HeapProd, HeapCons};
+
+const VISUAL_BUFFER_SIZE: usize = 512;
 
 #[derive(Params)]
-struct SineParams {}
+struct SineParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
+}
 
 struct SimpleSine {
     params: Arc<SineParams>,
@@ -13,23 +20,31 @@ struct SimpleSine {
     note_on: bool,
     sample_rate: f32,
     last_output: f32,
+    prod: HeapProd<f32>,
+    cons: HeapCons<f32>,
 }
 
 impl Default for SineParams {
     fn default() -> Self {
-        SineParams {}
+        Self {
+            editor_state: EguiState::from_size(420, 220),
+        }
     }
 }
 
 impl Default for SimpleSine {
     fn default() -> Self {
-        SimpleSine {
+        let rb = HeapRb::<f32>::new(VISUAL_BUFFER_SIZE);
+        let (pro, con) = rb.split();
+        Self {
             params: Arc::new(SineParams::default()),
             phase: 0.0,
             freq_hz: 440.0,
             note_on: false,
             sample_rate: 44100.0,
             last_output: 0.0,
+            prod: pro,
+            cons: con,
         }
     }
 }
@@ -97,6 +112,50 @@ impl Plugin for SimpleSine {
         self.note_on = false;
     }
 
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let egui_state = self.params.editor_state.clone();
+        let mut samples = Vec::with_capacity(VISUAL_BUFFER_SIZE);
+        while let Some(s) = self.cons.try_pop() {
+            samples.push(s);
+        }
+
+        create_egui_editor(
+            egui_state,
+            (),                 // no user_state needed
+            |_ctx, _state| {},  // build()
+            move |ctx, _setter, _state| {
+                use nih_plug_egui::egui::*;
+
+                CentralPanel::default().show(ctx, |ui| {
+                    ui.heading("Wave");
+
+                    let (rect, _) = ui.allocate_exact_size(
+                        vec2(ui.available_width(), 140.0),
+                        Sense::hover(),
+                    );
+                    let painter = ui.painter_at(rect);
+
+                    if samples.len() >= 2 {
+                        let w = rect.width().max(1.0);
+                        let h = rect.height().max(1.0);
+
+                        let to_pos = |i: usize, s: f32| {
+                            let x = rect.left() + (i as f32 / (samples.len() - 1) as f32) * w;
+                            let y = rect.center().y - s.clamp(-1.0, 1.0) * (h * 0.45);
+                            pos2(x, y)
+                        };
+
+                        let points: Vec<Pos2> = samples.iter().enumerate().map(|(i, &s)| to_pos(i, s)).collect();
+                        painter.add(Shape::line(points, Stroke::new(1.0, Color32::GREEN)));
+                        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::DARK_GRAY), StrokeKind::Outside);
+                    } else {
+                        ui.label("wave needs at least 2 samples");
+                    }
+                });
+            },
+        )
+    }
+
     fn process(
         &mut self,
         buffer: &mut Buffer,
@@ -138,6 +197,8 @@ impl Plugin for SimpleSine {
                 value = delta * value + (1.0 - delta) * self.last_output;
                 self.last_output = value;
                 value *= level;
+
+                let _ = self.prod.try_push(value);
 
                 self.phase += delta;
                 if self.phase >= 1.0 {
