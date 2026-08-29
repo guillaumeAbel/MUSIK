@@ -1,4 +1,3 @@
-use std::f32::consts::PI;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, EguiState};
 use std::num::NonZeroU32;
@@ -18,12 +17,7 @@ enum BgTask {
 
 struct SimpleSine {
     params: Arc<SineParams>,
-
-    phase: f32,
-    freq_hz: f32,
     note_on: bool,
-    sample_rate: f32,
-    last_output: f32,
     samples: Arc<Mutex<Vec<f32>>>,
     fft_data: Arc<Mutex<Vec<f32>>>,
 }
@@ -40,134 +34,12 @@ impl Default for SimpleSine {
     fn default() -> Self {
         Self {
             params: Arc::new(SineParams::default()),
-            phase: 0.0,
-            freq_hz: 440.0,
             note_on: false,
-            sample_rate: 44100.0,
-            last_output: 0.0,
             samples: Arc::new(Mutex::new(Vec::<f32>::with_capacity(VISUAL_BUFFER_SIZE))),
             fft_data: Arc::new(Mutex::new(Vec::<f32>::new())),
         }
     }
-}
 
-fn midi_note_to_freq(note: u8) -> f32 {
-    let n = note as f32;
-    440.0 * 2f32.powf((n - 69.0) / 12.0)
-}
-
-fn poly_blep(mut t: f32, delta: f32) -> f32 {
-    if t < delta {
-        t /= delta;
-        return t + t - t * t - 1.0;
-    } else if t > 1.0 - delta {
-        t = (t - 1.0) / delta;
-        return t * t + t + t + 1.0;
-    }
-    0.0
-}
-
-/// Calcule la magnitude du spectre (FFT) d'un signal réel.
-///
-/// - `samples` : signal temporel (f32)
-/// - Retour : magnitudes des fréquences de 0 à Nyquist (N/2 bins)
-///
-/// Implémentation :
-/// - zero-pad jusqu'à la puissance de 2 >= samples.len()
-/// - FFT complexe radix-2 itératif, in-place
-/// - retourne |X[k]| pour k ∈ [0, N/2)
-pub fn compute_fft(samples: &[f32]) -> Vec<f32> {
-    let len = samples.len();
-    if len == 0 {
-        return Vec::new();
-    }
-
-    // taille FFT = puissance de 2 >= len
-    let n = len.next_power_of_two();
-
-    // buffer complexe : (re, im)
-    let mut buffer = vec![(0.0f32, 0.0f32); n];
-    for (i, &s) in samples.iter().enumerate() {
-        buffer[i].0 = s;
-    }
-
-    // FFT en place
-    fft_in_place(&mut buffer);
-
-    // magnitudes sur [0 .. N/2)
-    let half = n / 2;
-    let mut mags = Vec::with_capacity(half);
-    for k in 0..half {
-        let (re, im) = buffer[k];
-        let mag = (re * re + im * im).sqrt();
-        mags.push(mag);
-    }
-
-    mags
-}
-
-/// FFT complexe radix-2 in-place sur un buffer de (re, im).
-///
-/// - `buffer.len()` doit être une puissance de 2.
-fn fft_in_place(buffer: &mut [(f32, f32)]) {
-    let n = buffer.len();
-    debug_assert!(n.is_power_of_two());
-
-    // 1) Réorganisation bit-reversed
-    bit_reverse_reorder(buffer);
-
-    // 2) Étapes de papillons
-    let mut len = 2;
-    while len <= n {
-        let half = len / 2;
-        let theta = -2.0 * PI / (len as f32);
-        let wlen = (theta.cos(), theta.sin()); // e^{-i 2π/len}
-
-        let mut i = 0;
-        while i < n {
-            let mut w = (1.0f32, 0.0f32); // facteur de rotation courant
-
-            for j in 0..half {
-                let u = buffer[i + j];
-                let t = complex_mul(buffer[i + j + half], w);
-
-                // papillon
-                buffer[i + j] = (u.0 + t.0, u.1 + t.1);
-                buffer[i + j + half] = (u.0 - t.0, u.1 - t.1);
-
-                w = complex_mul(w, wlen);
-            }
-
-            i += len;
-        }
-
-        len <<= 1;
-    }
-}
-
-/// Réorganisation bit-reversed du buffer.
-fn bit_reverse_reorder(buffer: &mut [(f32, f32)]) {
-    let n = buffer.len();
-    let mut j = 0usize;
-
-    for i in 1..(n - 1) {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j &= !bit;
-            bit >>= 1;
-        }
-        j |= bit;
-
-        if i < j {
-            buffer.swap(i, j);
-        }
-    }
-}
-
-#[inline]
-fn complex_mul(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
-    // (a_re + i a_im) * (b_re + i b_im)
-    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
 }
 
 impl Plugin for SimpleSine {
@@ -228,8 +100,7 @@ impl Plugin for SimpleSine {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.sample_rate = buffer_config.sample_rate;
-        self.phase = 0.0;
+        self.osc = Oscillator::new(buffer_config.sample_rate, None, Optional<f32>::New(0.25));
         true
     }
 
@@ -415,55 +286,33 @@ impl Plugin for SimpleSine {
 
             match event {
                 NoteEvent::NoteOn { note, .. } => {
-                    self.freq_hz = midi_note_to_freq(note);
-                    self.note_on = true;
-                }
+                    let wave = self.osc.compute_wave(midi_to_frequency(note)); // Vec<Vec<f32>>
+
+                    //trouver meilleur méthode, en passant un itérator à l'obj oscillator ?
+                    for (i, frame) in buffer.iter_samples().enumerate() {
+                        for (c, dst) in frame.into_iter().enumerate() {
+                            *dst = wave
+                                .get(c)
+                                .and_then(|ch| ch.get(i))
+                                .copied()
+                                .unwrap_or(0.0);
+                        }
+                    }
                 NoteEvent::NoteOff { .. } => {
-                    self.note_on = false;
-                    self.phase = 0.0;
+                    self.osc.reset_phase();
                 }
                 _ => {
                 }
             }
         }
 
-        let delta = self.freq_hz / self.sample_rate.max(1.0); 
-        let level: f32 = 0.3;
-
-        for mut channel_samples in buffer.iter_samples() {
-            let mut value: f32;
-            if self.note_on {
-                if self.phase < 0.5 {
-                    value = 1.0;
-                } else {
-                    value = -1.0;
-                }
-                value += poly_blep(self.phase, delta);
-                let t = (self.phase + 0.5) % 1.0;
-                value -= poly_blep(t, delta);
-                //from square to triangle
-                value = delta * value + (1.0 - delta) * self.last_output;
-                self.last_output = value;
-                value *= level;
-
-                let ptr = self.samples.clone();
-                let mut samples_lock = ptr.lock().unwrap();
-                if samples_lock.len() < VISUAL_BUFFER_SIZE {
-                    samples_lock.push(value);
-                }
-                drop(samples_lock);
-
-                self.phase += delta;
-                if self.phase >= 1.0 {
-                    self.phase -= 1.0;
-                }
-            } else {
-                value = 0.0;
-            }
-            for sample in channel_samples.iter_mut() {
-                *sample = value;
-            }
+        //push to visual buffer
+        let ptr = self.samples.clone();
+        let mut samples_lock = ptr.lock().unwrap();
+        if samples_lock.len() < VISUAL_BUFFER_SIZE {
+            
         }
+        drop(samples_lock);
 
         ProcessStatus::Normal
     }
